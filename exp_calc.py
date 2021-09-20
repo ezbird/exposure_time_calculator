@@ -25,7 +25,7 @@ inst is the efficiency of the instrument
 filt is the efficiency of the filter
 det  is the efficiency of the detector
 
-NOTE: a, and perhaps some of the system efficiencies are time-variable; 
+NOTE: a, and perhaps some of the system efficiencies, are time-variable; 
 a is also spatially variable.
 
 Output:
@@ -34,6 +34,16 @@ The final number of photons per second is critical to know in order to estimate
 expected errors and exposure times in observing proposals, observing runs, etc. 
 Understanding errors and the uncertainty in the measurement as a function of 
 exposure time is absolutely critical.
+
+Classes
+--------------
+Object
+Instrument
+Telescope
+Mirror
+Instrument
+Detector
+Observation
 
 """
 from astropy.modeling import models
@@ -45,13 +55,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 class Object:
-    """ 
+    '''
     	Astronomical object
         Provide an input spectrum or choose a blackbody.
         Specify temp and magnitude.
         
 		Methods: F_nu, F_lambda, photon flux
-    """
+    '''
     def __init__(self,type='blackbody',temp_eff=10000, mag=0, refmag='V'):
         self.type = type
         self.temp_eff = temp_eff
@@ -62,7 +72,7 @@ class Object:
         # Return SED in F_nu or F_lambda, with units (depending on source of data)
         if self.type == 'blackbody' :
             the_bb = BlackBody(temperature=self.temp_eff*u.K)
-            norm= 3.63e-9*u.erg/u.cm**2/u.s/u.angstrom / \
+            norm= 3.63e-9 * u.erg/u.cm**2 / u.s / u.angstrom / \
                   (the_bb(5500*u.angstrom)*u.sr*c.c/(5500*u.angstrom)**2).to(u.erg/u.cm**2/u.s/u.angstrom)
             return the_bb(wave)*norm*u.sr*10.**(-0.4*self.mag)
         else :
@@ -114,7 +124,8 @@ class Telescope :
         if name == 'ARC3.5m' :
             self.diameter=3.5*u.m
             self.mirrors=['Al','Al','Al']
-            self.eps=0.4   # What is this???
+            self.eps=0.4   					# What is this???
+
         elif name == 'TMO' :
             self.diameter=0.6*u.m
             self.mirrors=['Al','Al']
@@ -124,7 +135,7 @@ class Telescope :
             self.eps=0.
             self.mirrors=mirrors
         else :
-            raise ValueError('The telescope specified is unknown.')
+            raise ValueError('Telescope details are unknown.')
     
     def area(self) :
         # Collecting area of the telescope
@@ -137,8 +148,10 @@ class Telescope :
                 # if mirrors is a float, use it as a constant throughput (bad practice!)
                 t *= mir
             else :
-                tmp = Mirror(mir)
-                t *= tmp.reflectivity(wave)
+                t *= 1
+                # Will bring in the mirrors when we have a mirror coating file
+                #tmp = Mirror(mir)
+                #t *= tmp.reflectivity(wave)
         return t
             
 class Mirror :
@@ -158,10 +171,10 @@ class Mirror :
             return np.ones(len(wave)) + self.const
             
         else :
-            # read data file depending on mirror coating type
-            try: dat=ascii.read(os.environ['ETC_DIR']+'/data/mirror/'+self.type+'.txt')
+            try: 
+            	f = open('mirror_coating.txt', 'r')  # We need to re-open the file
             except FileNotFoundError :
-                raise ValueError('unknown coating type: {:s}',self.type)
+                raise ValueError('Coating file not found: {:s}',self.type)
             wav=dat['col1']
             ref=dat['col2']/100.
             interp=scipy.interpolate.interp1d(wav,ref)
@@ -176,12 +189,21 @@ class Instrument :
     	an array of transmission % for each wavelength.
     """
     def __init__(self,name='',efficiency=0.8) :
-        self.name=name
+        self.name=tel.name
         self.efficiency=efficiency
         self.detector = Detector(efficiency=1.)
+
+        if tel.name == 'ARC3.5m' :
+            self.plate_scale   = 0.258 	 		# ARC 3.5m; arcsec/pixel
+            self.binning 	   = 2*2	 	 	# ARC 3.5m; 2x2
+            self.readout_noise = 3.7			# ARC 3.5m; Read out noise (slow readout; > 3 seconds)
+            self.num_pixels    = 1024*1024   	# ARC 3.5m; 1024 x 1024 pixels
+            self.pixel_size    = 15*u.m   		# ARC 3.5m; 15 microns
             
     def throughput(self,wave) :
         if self.name == '' :
+            return np.ones(len(wave))*self.efficiency
+        elif self.name == 'ARC3.5m' :
             return np.ones(len(wave))*self.efficiency
         else :
             raise ValueError('Instrument error {:s}',self.name)
@@ -194,6 +216,9 @@ class Instrument :
             return out
         else :
             try: 
+            	
+            	#issue a warning/error if the desired wavelengths don't cover the transmission of the filter
+            	
             	f = open('APO_filter.txt', 'r')  # We need to re-open the file
             	# Loop over lines and extract variables of interest
             	for line in f:
@@ -207,8 +232,6 @@ class Instrument :
             except FileNotFoundError :
                 raise ValueError('No filter file found: {:s} for instrument {:s}',
                                  filter, self.name)
-
-            #raise ValueError('Name {:s} not yet implemented'.format(self.name))
         
 class Detector :
     """ 
@@ -251,20 +274,58 @@ class Observation :
     	Integrate the photon flux over all wavelengths
     	at the end.
     """
-    def __init__(self,obj=None,atmos=None,telescope=None,instrument=None,wave=np.arange(3000,10000,1)*u.angstrom) :
-        self.obj = obj
-        self.atmos = atmos
-        self.telescope = telescope
+    def __init__(self,obj=None,atmos=None,telescope=None,instrument=None, wave=np.arange(3000,10000,1)*u.angstrom, SN=None, exp_time=None):
+        self.obj 		= obj
+        self.atmos 		= atmos
+        self.telescope 	= telescope
         self.instrument = instrument
-        self.wave=wave
+        self.wave		= wave
+        self.exp_time	= exp_time
         
+    def calc_signal_to_noise(self): # provide exposure time in seconds
+        """
+        If given exposure time and the object's magnitude, we calculate the SNR
+         Just Poisson noise for now: square root of counts
+         We need to get the counts/second (N) from the magnitude:
+         	m = -2.5 log (N/t) >>>> 10^(-m/2.5) = N/t
+         	obj.mag will eventually be obj.mag = obj.mag + (extinction x airmass)
+         Then, SNR = (N x t) / sqrt( N x t + S x p x t + p x R^2 )
+         Where S = N x scale^2 x binning^2
+        		R = read-out noise (measured in the lab)
+        		p = number of pixels in the measuring aperture
+        """
+        if (self.exp_time == None):
+        	raise ValueError('No exposure time provided.')
+        
+        N 	    	= 1000 * (10**(-obj.mag/2.5)) * self.exp_time 	# multiply times thousand for vega's base count rate
+        plate_scale = inst.plate_scale 	 							# ARC 3.5m; arcsec/pixel
+        binning 	= inst.binning 	 	 									# ARC 3.5m; 2x2
+        R 			= inst.readout_noise		 					# ARC 3.5m; Read out noise (slow readout; > 3 seconds)
+        p  			= inst.num_pixels
+        S 	    	= N * plate_scale**2 * binning**2
+        
+        SNR     = (N * self.exp_time) / np.sqrt( (N*self.exp_time) + (S*p*self.exp_time) + (p*R**2) )
+        return SNR
+    
+    def calc_exposure_time(sig_to_noise):
+        # If given SNR value and the object's magnitude, we calculate the need exposure time
+        # We can solve the SNR equation for t, rearranging to make a quadratic.
+        
+        if (self.sig_to_noise == None):
+        	raise ValueError('No signal to noise provided.')
+        	
+        a = N**2
+        b = (SNR^2) * (N + (p * S) )
+        c = (SNR^2) * p * R**2
+        return signaltonoise
+    
     def photonflux(self) :
         # Returns photon flux
         photflux = (obj.photflux(self.wave)* 
                 self.atmos.throughput(self.wave) *
                 self.telescope.area()*self.telescope.throughput(self.wave)*
                 self.instrument.throughput(self.wave)*self.instrument.filter(self.wave) ) 
-        print(photflux)
+        #print(photflux)
         return photflux
     
     def final_counts_per_second(self) :
@@ -274,16 +335,17 @@ class Observation :
         
         
 # Array of wavelengths to observe
-wave=np.arange(3400,6000,5)*u.angstrom
+wave  = np.arange(3400,6000,5)*u.angstrom
 
 # Initiative our 4 classes
-obj   = Object(type='blackbody', temp_eff=7000, mag=10) # Specify an object with temp and magnitude
-tel   = Telescope(diameter=0.6*u.m, mirrors=[1.0])   	# Specify a telescope with size and num of mirrors
-inst  = Instrument(efficiency=0.5)						# Specify the instrument's efficiency
-atmos = Atmosphere(transmission=0.8)					# Specify the efficiency of the atmosphere
+obj   = Object( type='blackbody', temp_eff=7000, mag=10 ) # Specify an object with temp and magnitude
+tel   = Telescope( name='ARC3.5m',diameter=0.6*u.m, mirrors=[1.0] )   	  # Specify a telescope with size and num of mirrors
+inst  = Instrument( efficiency=0.5 )					  # Specify the instrument's efficiency
+atmos = Atmosphere( transmission=0.8 )					  # Specify the efficiency of the atmosphere
 
 # Call our observation class with our 4 situation classes
-obs=Observation(obj=obj,atmos=atmos,telescope=tel,instrument=inst,wave=wave)
+# Either a SNR or an exposure time should be provided.
+obs   = Observation(obj=obj,atmos=atmos,telescope=tel,instrument=inst,wave=wave,exp_time=1000) #
 
 # Throughput of each component, each reducing the final photons per second received
 # ---------------------------------------------------------------------------------
@@ -312,9 +374,10 @@ plt.plot(wave,photflux, label='Obj + Tel + Atm + Inst + Filter', linewidth=4)
 # 6.) With an imaging instrument, we want to integrate over the spectrum 
 #     to get the total signal in photons per second
 print(obs.final_counts_per_second())
+print("SNR: ",obs.calc_signal_to_noise())
 
 plt.legend(loc="upper left")
 plt.ylabel('Counts')
 plt.xlabel('Wavelength (A)')
-plt.title('Approximate Signal for APO 3.5m')
+plt.title('Expected Signal for APO 3.5m')
 plt.show()
